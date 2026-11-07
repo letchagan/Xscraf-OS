@@ -1,0 +1,10 @@
+[target.'cfg(target_os = "none")']
+runner = "bootimage runner"
+
+[build]
+target = "x86_64-aether_kernel.json"
+
+[unstable]
+json-target-spec = true
+build-std = ["core", "alloc", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
