@@ -1,8 +1,53 @@
-# AetherOS Threat Model
+# Xscraf-OS Threat Model
 
 ## System Overview
 
-AetherOS is a Rust-based, capability-oriented microkernel-style OS for x86_64. This threat model covers the **target architecture** (Stages 3–4+) — not the current Stage 2 prototype which runs entirely in Ring 0.
+**Xscraf-OS** is a Rust-based, **capability-oriented microkernel** for x86_64 with a distinctive **task-based execution model**. Unlike traditional Unix/Linux (fork/exec) or Windows (process/thread), Xscraf-OS uses:
+
+- **Lightweight tasks** (not heavy processes) with sealed address spaces
+- **Priority-budgets**: Each task has a CPU time quota + priority level
+- **Hierarchical task trees**: Parent/child relationships with capability delegation
+- **Message-passing IPC**: No shared memory; all inter-task communication via kernel-copied messages
+- **Mandatory access control**: Capabilities are the only way to grant permissions
+
+This threat model covers Stages 3–4+ (user mode, paging, scheduling) — not the current Stage 2 which runs in Ring 0.
+
+---
+
+## Xscraf-OS Execution Model (Unique Design)
+
+### Task vs Process
+Unlike Unix processes or Windows processes, Kairos-11 **tasks** are:
+- **Lightweight**: Minimal memory overhead (just address space + capability set)
+- **Sealed**: Complete memory isolation; no cross-task shared memory
+- **Hierarchical**: Parent tasks create and control child tasks
+- **Budget-aware**: Each task has CPU time allocation + priority
+- **Capability-based**: Only via explicit capability grants
+
+### Example Task Tree
+```
+                    [Init Task]
+                   (parent cap)
+                   /          \
+        [App A]              [App B]
+      (cpuset)            (cpuset + message cap)
+       /     \                  \
+    [A1]   [A2]               [B1]
+ (message)                  (read cap)
+```
+
+Task A1 can **only**:
+- Read/write own memory
+- Send messages to its parent (App A)
+- Call capabilities explicitly granted by parent
+
+### Priority Budget Scheduling
+Each task has:
+- **Priority**: 0–255 (higher = more CPU time, but not exclusive)
+- **Budget**: N milliseconds of CPU time per scheduling round
+- **Fair queuing**: All same-priority tasks get equal time, then lower-priority
+
+**Difference from traditional priority**: Tasks never starve completely (minimum fairness).
 
 ---
 

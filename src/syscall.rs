@@ -1,4 +1,5 @@
 use crate::{gdt, serial_println};
+use alloc::vec;
 use x86_64::{
     registers::model_specific::{Star, LStar, SFMask, KernelGsBase},
     registers::rflags::RFlags,
@@ -9,7 +10,7 @@ use x86_64::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum SyscallNumber {
-    /// Exit the current process
+    /// Exit the current task
     Exit = 0,
     /// Write to a file descriptor
     Write = 1,
@@ -19,10 +20,16 @@ pub enum SyscallNumber {
     Alloc = 3,
     /// Free memory
     Free = 4,
-    /// Get process ID
+    /// Get task ID
     GetPid = 5,
     /// Yield CPU
     Yield = 6,
+    /// Create a child task (Xscraf-OS unique)
+    CreateTask = 7,
+    /// Send message to another task (message-passing IPC)
+    SendMessage = 8,
+    /// Receive message from queue (message-passing IPC)
+    ReceiveMessage = 9,
 }
 
 /// Syscall return value
@@ -159,6 +166,176 @@ extern "C" fn syscall_handler(
             serial_println!("[SYSCALL] Yield");
             Ok(0)
         }
+        SyscallNumber::CreateTask => {
+            // arg1 = entry_point, arg2 = stack_size, arg3 = priority
+            serial_println!("[SYSCALL] CreateTask(entry={:#x}, stack_size={}, priority={})", arg1, arg2, arg3);
+
+            let caller_id = crate::task::current_task()
+                .unwrap_or(crate::task::TaskId(1));
+
+            // SECURITY CHECK 1: Verify caller has CapCreateTask
+            let create_cap = crate::task::Capability::CreateTask;
+            if !crate::task::has_capability(caller_id, &create_cap) {
+                serial_println!("[SYSCALL] DENIED: Task {} lacks CapCreateTask", caller_id.as_u64());
+                return SyscallError::PermissionDenied as u64;
+            }
+
+            // VALIDATION: Priority range
+            if arg3 > 255 {
+                serial_println!("[SYSCALL] ERROR: priority {} > 255", arg3);
+                return SyscallError::InvalidArgument as u64;
+            }
+
+            // VALIDATION: Stack size range
+            if arg2 == 0 || arg2 > 1024 * 1024 {
+                serial_println!("[SYSCALL] ERROR: invalid stack size {}", arg2);
+                return SyscallError::InvalidArgument as u64;
+            }
+
+            // VALIDATION: Entry point in user-space
+            if arg1 >= 0x8000_0000_0000 {
+                serial_println!("[SYSCALL] ERROR: entry point {:#x} outside user-space", arg1);
+                return SyscallError::InvalidArgument as u64;
+            }
+
+            // Create child task
+            let pml4_frame = crate::memory::create_address_space();
+            let stack_ptr = 0x7000_0000u64;
+
+            let child_id = crate::task::create_task(
+                Some(caller_id),
+                arg1,
+                pml4_frame,
+                stack_ptr
+            );
+
+            // Grant child capabilities (attenuated from parent)
+            let send_cap = crate::task::Capability::SendMessage {
+                dest_task: caller_id.as_u64(),
+                max_size: 4096,
+            };
+            let exit_cap = crate::task::Capability::Exit;
+
+            crate::task::grant_capability(child_id, send_cap);
+            crate::task::grant_capability(child_id, exit_cap);
+
+            serial_println!("[SYSCALL] CreateTask SUCCESS: created task {}", child_id.as_u64());
+            Ok(child_id.as_u64())
+        }
+        SyscallNumber::SendMessage => {
+            // arg1 = dest_task_id, arg2 = msg_ptr, arg3 = msg_size
+            serial_println!("[SYSCALL] SendMessage(dest={}, msg_ptr={:#x}, size={})", arg1, arg2, arg3);
+
+            let sender_id = crate::task::current_task()
+                .unwrap_or(crate::task::TaskId(1));
+
+            // VALIDATION: Message size
+            if arg3 == 0 || arg3 > 4096 {
+                serial_println!("[SYSCALL] ERROR: message size {} invalid", arg3);
+                return SyscallError::InvalidArgument as u64;
+            }
+
+            // SECURITY CHECK 1: Verify sender has CapSendMessage to dest
+            let send_cap = crate::task::Capability::SendMessage {
+                dest_task: arg1,
+                max_size: arg3,
+            };
+            if !crate::task::has_capability(sender_id, &send_cap) {
+                serial_println!("[SYSCALL] DENIED: Task {} lacks CapSendMessage({}, {})",
+                    sender_id.as_u64(), arg1, arg3);
+                return SyscallError::PermissionDenied as u64;
+            }
+
+            // SECURITY CHECK 2: Validate user pointer with bounds
+            if let Err(e) = crate::userspace::validate_pointer_for_task(arg2, arg3 as usize) {
+                serial_println!("[SYSCALL] ERROR: Invalid pointer: {}", e);
+                return SyscallError::InvalidArgument as u64;
+            }
+
+            // SAFETY: Copy message data from user-space
+            let data = match crate::userspace::copy_from_user(arg2, arg3 as usize) {
+                Ok(d) => d,
+                Err(e) => {
+                    serial_println!("[SYSCALL] ERROR: Failed to copy message: {}", e);
+                    return SyscallError::InvalidArgument as u64;
+                }
+            };
+
+            // Create and send message
+            if let Ok(msg) = crate::ipc::Message::new(
+                sender_id,
+                crate::task::TaskId(arg1),
+                data
+            ) {
+                match crate::ipc::send_message(msg) {
+                    Ok(()) => {
+                        serial_println!("[SYSCALL] SendMessage SUCCESS: {} → {}",
+                            sender_id.as_u64(), arg1);
+                        Ok(0)
+                    }
+                    Err(e) => {
+                        serial_println!("[SYSCALL] ERROR: Send failed: {}", e);
+                        SyscallError::PermissionDenied as u64
+                    }
+                }
+            } else {
+                SyscallError::InvalidArgument as u64
+            }
+        }
+        SyscallNumber::ReceiveMessage => {
+            // arg1 = buf_ptr, arg2 = buf_size
+            serial_println!("[SYSCALL] ReceiveMessage(buf_ptr={:#x}, size={})", arg1, arg2);
+
+            let receiver_id = crate::task::current_task()
+                .unwrap_or(crate::task::TaskId(1));
+
+            // VALIDATION: Buffer size
+            if arg2 == 0 || arg2 > 4096 {
+                serial_println!("[SYSCALL] ERROR: buffer size {} invalid", arg2);
+                return SyscallError::InvalidArgument as u64;
+            }
+
+            // SECURITY CHECK: Verify receiver has CapReceiveMessage
+            let recv_cap = crate::task::Capability::ReceiveMessage {
+                max_size: arg2,
+            };
+            if !crate::task::has_capability(receiver_id, &recv_cap) {
+                serial_println!("[SYSCALL] DENIED: Task {} lacks CapReceiveMessage", receiver_id.as_u64());
+                return SyscallError::PermissionDenied as u64;
+            }
+
+            // SECURITY CHECK: Validate user pointer
+            if let Err(e) = crate::userspace::validate_pointer_for_task(arg1, arg2 as usize) {
+                serial_println!("[SYSCALL] ERROR: Invalid buffer pointer: {}", e);
+                return SyscallError::InvalidArgument as u64;
+            }
+
+            // Try to receive message
+            if let Some(msg) = crate::ipc::receive_message(receiver_id) {
+                let msg_size = msg.data.len();
+
+                // Check if message fits in buffer
+                if msg_size > arg2 as usize {
+                    serial_println!("[SYSCALL] ERROR: Message {} bytes > buffer {} bytes",
+                        msg_size, arg2);
+                    return SyscallError::InvalidArgument as u64;
+                }
+
+                // SAFETY: Copy message to user-space
+                if let Err(e) = crate::userspace::copy_to_user(&msg.data, arg1, msg_size) {
+                    serial_println!("[SYSCALL] ERROR: Failed to copy message to user: {}", e);
+                    return SyscallError::InvalidArgument as u64;
+                }
+
+                serial_println!("[SYSCALL] ReceiveMessage SUCCESS: from task {}, size={}",
+                    msg.sender_id.as_u64(), msg_size);
+                Ok(msg_size as u64)
+            } else {
+                // No message waiting (not an error)
+                serial_println!("[SYSCALL] No message waiting");
+                Ok(0)
+            }
+        }
     };
 
     match result {
@@ -179,6 +356,9 @@ impl TryFrom<u64> for SyscallNumber {
             4 => Ok(SyscallNumber::Free),
             5 => Ok(SyscallNumber::GetPid),
             6 => Ok(SyscallNumber::Yield),
+            7 => Ok(SyscallNumber::CreateTask),
+            8 => Ok(SyscallNumber::SendMessage),
+            9 => Ok(SyscallNumber::ReceiveMessage),
             _ => Err(()),
         }
     }

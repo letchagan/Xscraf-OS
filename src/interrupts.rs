@@ -195,9 +195,12 @@ extern "x86-interrupt"
 fn timer_interrupt_handler(
     _stack_frame: InterruptStackFrame,
 ) {
-    // IMPORTANT:
-    // Don't print to VGA from the timer interrupt.
+    // Call scheduler to switch tasks (if ready)
+    unsafe {
+        crate::scheduler::on_timer_tick();
+    }
 
+    // Send EOI to PIC
     unsafe {
         PICS.lock()
             .notify_end_of_interrupt(

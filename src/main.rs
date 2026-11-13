@@ -8,12 +8,22 @@ extern crate alloc;
 use bootloader::bootinfo::BootInfo;
 use bootloader::entry_point;
 
+mod benchmarks;
+mod context_switch;
+mod demo;
 mod gdt;
 mod input;
 mod interrupts;
+mod ipc;
+mod ipc_lockfree;
 mod memory;
+mod scheduler;
+mod scheduler_optimized;
 mod serial;
+mod stage4_test;
 mod syscall;
+mod task;
+mod userspace;
 mod vga_buffer;
 
 use core::alloc::Layout;
@@ -60,11 +70,11 @@ fn alloc_error_handler(layout: Layout) -> ! {
 
 fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("========================================");
-    serial_println!("       Welcome to AetherOS Kernel       ");
+    serial_println!("       Welcome to Xscraf-OS Kernel      ");
     serial_println!("========================================");
 
     println!("========================================");
-    println!("       Welcome to AetherOS Kernel       ");
+    println!("       Welcome to Xscraf-OS Kernel      ");
     println!("========================================");
     println!();
 
@@ -94,17 +104,38 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     interrupts::init_keyboard_controller();
     println!("[ OK ] PS/2 Keyboard initialized.");
 
+    task::init();
+    println!("[ OK ] Task manager initialized.");
+
+    ipc::init();
+    println!("[ OK ] Message-passing IPC initialized.");
+
+    scheduler::init_scheduler();
+    println!("[ OK ] Scheduler initialized.");
+
     serial_println!("[ OK ] Enabling CPU interrupts.");
     x86_64::instructions::interrupts::enable();
 
+    // Demonstrate Xscraf-OS unique features (Stage 3)
+    demo::demo_task_creation();
+    demo::demo_message_passing();
+
+    // Run Stage 4 tests (actual scheduling & syscalls)
+    stage4_test::run_stage4_tests();
+    stage4_test::test_syscall_handlers();
+    stage4_test::test_context_switching();
+
+    // Run Phase A performance benchmarks
+    benchmarks::run_all_benchmarks();
+
     println!();
     println!("========================================");
-    println!("       AetherOS Keyboard Ready          ");
+    println!("     Xscraf-OS Ready (Keyboard)        ");
     println!("========================================");
     println!("Type something (interrupt-driven):");
     println!();
 
-    serial_println!("[READY] AetherOS awaiting keyboard interrupts");
+    serial_println!("[READY] Xscraf-OS awaiting keyboard interrupts");
 
     loop {
         // Process any pending scancodes from the interrupt queue
